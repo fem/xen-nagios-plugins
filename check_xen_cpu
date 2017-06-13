@@ -1,0 +1,99 @@
+#!/usr/bin/env python2
+# check_xen_cpu
+# Report CPU Usage for Xen VMs
+# Author: Anton Schubert <ischluff@mailbox.org>
+# Copyright (c) 2017
+
+import sys, time, argparse
+from enum import Enum
+from xenstat import *
+
+class Status(Enum):
+    OK = 0
+    WARNING = 1
+    CRITICAL = 2
+    UNKNOWN = 3
+
+def get_domains(node):
+    count = xenstat_node_num_domains(node)
+    return map(lambda i: xenstat_node_domain_by_index(node, i), range(count))
+
+def get_domain_names(domains):
+    return map(lambda d: xenstat_domain_name(d), domains)
+
+def get_domain_times(domains):
+    return map(lambda d: xenstat_domain_cpu_ns(d), domains)
+
+def get_domain_cpus(domains):
+    return map(lambda d: xenstat_domain_num_vcpus(d), domains)
+
+def cputime_to_percent(sample1, sample2, diff):
+    return (sample2 - sample1) / (diff * 10.0e6)
+
+# output total usage + usage per vm
+def get_perfdata(num_cpus, cpus, names, avg):
+    total = sum(avg)
+    perfdata = "Total Usage = {:.2f}%, CPUs = {:d}|total={:.2f}%;;;0;{:d}".format(total, num_cpus, total, num_cpus * 100)
+    for i in range(len(names)):
+        perfdata += " domain_{:}={:.2f}%;;;0;{:d}".format(names[i], avg[i], cpus[i] * 100)
+    return perfdata
+
+# nagios compatible exit
+def exit_status(status, perfdata="", message=None,):
+    if message is not None:
+        print("CPU {:} - {:}".format(status.name, message))
+    else:
+        print("CPU {:} - {:}".format(status.name, perfdata))
+
+    sys.exit(status.value) 
+
+def main():
+    parser = argparse.ArgumentParser(description="Reports CPU Usage for xen VMs")
+    parser.add_argument("-i", dest="interval", type=int, default=1, help="sampling interval in s")
+    parser.add_argument("-s", dest="samples", type=int, default=5, help="number of samples")
+    args = parser.parse_args()
+
+    # initialize handle
+    handle = xenstat_init()
+    previous_sample = None
+    past = None
+    total = None
+
+    # prevent access without handle
+    if handle is None:
+        exit_status(Status.UNKNOWN, "Failed to get xenstat handle, you are probably not root")
+
+    # sample cpu usage
+    for n in range(args.samples + 1):
+        node = xenstat_get_node(handle, XENSTAT_ALL)
+        domains = get_domains(node)
+        sample = get_domain_times(domains)
+        now = time.time()
+
+        if previous_sample is not None:
+            percent = map(lambda i: cputime_to_percent(previous_sample[i], sample[i], now - past), range(len(sample)))
+            if total is not None:
+                total = map(sum, zip(total, percent))
+            else:
+                total = percent
+
+        previous_sample, past = sample, now
+
+        if n < args.samples:
+            time.sleep(args.interval)
+
+    # average all samples
+    avg = map(lambda x: x / float(args.samples), total)
+
+    # get additional info 
+    num_cpus = xenstat_node_num_cpus(node)
+    names = get_domain_names(domains)
+    cpus = get_domain_cpus(domains)
+    xenstat_uninit(handle)
+
+    # generate output
+    exit_status(Status.OK, get_perfdata(num_cpus, cpus, names, avg))
+
+if __name__ == "__main__":
+    main()
+
