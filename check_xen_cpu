@@ -2,9 +2,13 @@
 # check_xen_cpu
 # Report CPU Usage for Xen VMs
 # Author: Anton Schubert <ischluff@mailbox.org>
+# Version: 1.1
+# Changelog:
+#   2016-06-13 - 1.0 - Initial version
+#   2017-07-08 - 1.1 - Handle counter rollover
 # Copyright (c) 2017
 
-import sys, time, argparse
+import sys, time, argparse, math
 from enum import Enum
 from xenstat import *
 
@@ -28,6 +32,11 @@ def get_domain_cpus(domains):
     return map(lambda d: xenstat_domain_num_vcpus(d), domains)
 
 def cputime_to_percent(sample1, sample2, diff):
+    # handle rollover
+    if (sample2 < sample1):
+        estimated_max = 2**math.ceil(math.log(sample1)/math.log(2))
+        sample1 -= estimated_max
+
     return (sample2 - sample1) / (diff * 10.0e6)
 
 # output total usage + usage per vm
@@ -85,7 +94,7 @@ def main():
     # average all samples
     avg = map(lambda x: x / float(args.samples), total)
 
-    # get additional info 
+    # get additional info
     num_cpus = xenstat_node_num_cpus(node)
     names = get_domain_names(domains)
     cpus = get_domain_cpus(domains)
@@ -96,4 +105,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
