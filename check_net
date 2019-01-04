@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+# check_net
+# Reports Network Traffic for all interfaces
+# Author: Anton Schubert <ischluff@mailbox.org>
+# Version: 1.0
+# Changelog:
+#   2018-06-05 - 1.0 - Initial version
+# Copyright (c) 2018
+from __future__ import print_function
+import os, sys, time, argparse, math, json
+import re
+from enum import IntEnum
+
+class Status(IntEnum):
+    OK = 0
+    WARNING = 1
+    CRITICAL = 2
+    UNKNOWN = 3
+
+def parse_net_stats(data):
+    data = data.split("\n")
+
+    results = {}
+    for i in range(2, len(data) - 1):
+        fields = re.split("\s+", data[i].strip())
+        results[fields[0][:-1]] = {
+            "rbytes": int(fields[1]),
+            "tbytes": int(fields[9])
+        }
+
+    return results
+
+def diff_samples(s1, s2, diff):
+    results = {}
+    for n2,d2 in s2.items():
+        for n1,d1 in s1.items():
+            if n1 == n2:
+                results[n2] = dict((k, (d2[k]-d1[k]) / diff) for k in d2 if k in d1)
+                break
+    return results
+
+# output total usage + usage per vm
+def get_perfdata(results, diff):
+    total_rxrate = sum(v["rbytes"] for n,v in results.items()) * 8 / 1024**2
+    total_txrate = sum(v["tbytes"] for n,v in results.items()) * 8 / 1024**2
+    perfdata = "Rx = {:.2f}Mbit/s, Tx = {:.2f}Mbit/s in {:.0f}s|".format(total_rxrate, total_txrate, diff)
+    for name,value in results.items():
+        perfdata += " {:}_rx={:.2f}B".format(name, value["rbytes"])
+        perfdata += " {:}_tx={:.2f}B".format(name, value["tbytes"])
+    return perfdata
+
+# nagios compatible exit
+def exit_status(status, perfdata="", message=None,):
+    if message is not None:
+        print("Net {:} - {:}".format(status.name, message))
+    else:
+        print("Net {:} - {:}".format(status.name, perfdata))
+
+    sys.exit(status.value)
+
+def main():
+    histfile = "/tmp/.check_net"
+    status = Status.OK
+    parser = argparse.ArgumentParser(description="Reports Network Stats for all Interfaces")
+    args = parser.parse_args()
+
+    # get sample
+    with open("/proc/net/dev", "r") as f:
+        data = f.read()
+
+    sample = parse_net_stats(data)
+    now = time.time()
+
+    # load history file
+    try:
+        stat = os.stat(histfile)
+        past = stat.st_mtime
+        with open(histfile) as f:
+            previous_sample = json.load(f)
+
+    except (IOError,OSError) as e:
+        if e.errno == os.errno.ENOENT:
+            status, message = Status.UNKNOWN, "History file not written yet"
+        else:
+            status, message = Status.UNKNOWN, "Failed to read the history file - {:}".format(e.strerror)
+
+    # write history file
+    with open(histfile, 'w') as f:
+        json.dump(sample, f)
+
+    # early exit on errors
+    if status > Status.OK:
+        exit_status(status, message)
+
+    # compute values
+    results = diff_samples(previous_sample, sample, now - past)
+
+    # generate output
+    exit_status(Status.OK, get_perfdata(results, now - past))
+
+if __name__ == "__main__":
+    main()

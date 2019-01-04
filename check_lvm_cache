@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+# check_lvm_cache
+# Reports Cache stats for dm-caches using dmsetup
+# Author: Anton Schubert <ischluff@mailbox.org>
+# Version: 1.0
+# Changelog:
+#   2017-11-22 - 1.0 - Initial version
+# Copyright (c) 2017
+import os, sys, argparse, subprocess
+from enum import IntEnum
+
+class Status(IntEnum):
+    OK = 0
+    WARNING = 1
+    CRITICAL = 2
+    UNKNOWN = 3
+
+def parse_stats(lines):
+    parts = lines[0].split(" ")
+    if len(parts) < 3:
+        return None
+
+    parttype = parts[2]
+    if parttype != "cache":
+        return None
+
+    metadata_size = parts[4].split("/")
+    data_size = parts[6].split("/")
+    read_hits = max(1, int(parts[7]))
+    write_hits = max(1, int(parts[9]))
+    return {
+        "used_metadata": int(metadata_size[0]) / int(metadata_size[1]) * 100,
+        "used_data": int(data_size[0]) / int(data_size[1]) * 100,
+        "read_hitrate": read_hits / (read_hits + int(parts[8])) * 100,
+        "write_hitrate": write_hits / (write_hits + int(parts[10])) * 100,
+        "dirty": int(parts[13]) / int(data_size[1]) * 100,
+        "demotions": int(parts[11]),
+        "promotions": int(parts[12])
+    }
+    return sample
+
+def get_perfdata(sample):
+    perfdata = "Data Usage = {:.2f}%, Metadata Usage = {:.2f}%, Read Hitrate = {:.2f}%, Write Hitrate = {:.2f}%|".format(
+        sample["used_data"], sample["used_metadata"], sample["read_hitrate"], sample["write_hitrate"])
+    results = list(sample.items())
+    results.sort()
+    for name,value in results:
+        perfdata += "{}={} ".format(name, value)
+    return perfdata
+
+# nagios compatible exit
+def exit_status(status, perfdata="", message=None,):
+    if message is not None:
+        print("Cache {:} - {:}".format(status.name, message))
+    else:
+        print("Cache {:} - {:}".format(status.name, perfdata))
+
+    sys.exit(status.value)
+
+def main():
+    parser = argparse.ArgumentParser(description="Reports Cache stats for dm-cache partitions")
+    parser.add_argument("device", help="cached dm")
+    args = parser.parse_args()
+
+    # get sample
+    cmd = ["/sbin/dmsetup", "status", args.device]
+    try:
+        output = subprocess.check_output(cmd)
+        lines = output.decode("utf-8").split("\n")
+    except (CalledProcessError, UnicodeError) as e:
+        if isinstance(e, CalledProcessError):
+            exit_status(Status.UNKNOWN, "Failed to read stats with dmsetup - {:}".format(e.output))
+        else:
+            exit_status(Status.UNKNOWN, "Failed to parse dmsetup output")
+
+    sample = parse_stats(lines)
+
+    if sample is None:
+        exit_status(Status.UNKNOWN, "Device {} not found, or not a cache".format(args.device))
+
+    ## generate output
+    exit_status(Status.OK, get_perfdata(sample))
+
+if __name__ == "__main__":
+    main()
