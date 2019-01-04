@@ -1,18 +1,20 @@
 #!/usr/bin/env python2
 # check_xen_cpu
-# Report CPU Usage for Xen VMs
+# Reports CPU Usage for Xen VMs
 # Author: Anton Schubert <ischluff@mailbox.org>
-# Version: 1.1
+# Version: 2.1
 # Changelog:
 #   2016-06-13 - 1.0 - Initial version
 #   2017-07-08 - 1.1 - Handle counter rollover
+#   2017-07-17 - 2.0 - Use history-file instead of sampling approach
+#   2017-07-23 - 2.1 - Only initialize xenstat handle for VCPU stats
 # Copyright (c) 2017
 
-import sys, time, argparse, math
-from enum import Enum
+import os, sys, time, argparse, math, json
+from enum import IntEnum
 from xenstat import *
 
-class Status(Enum):
+class Status(IntEnum):
     OK = 0
     WARNING = 1
     CRITICAL = 2
@@ -39,12 +41,25 @@ def cputime_to_percent(sample1, sample2, diff):
 
     return (sample2 - sample1) / (diff * 10.0e6)
 
+def diff_results(samples1, samples2, diff):
+    results = []
+    for name,value in samples2:
+        for other_name,other_value in samples1:
+            if other_name == name:
+                results.append((name, cputime_to_percent(other_value, value, diff)))
+                continue
+
+    return results
+
 # output total usage + usage per vm
-def get_perfdata(num_cpus, cpus, names, avg):
-    total = sum(avg)
-    perfdata = "Total Usage = {:.2f}%, CPUs = {:d}|total={:.2f}%;;;0;{:d}".format(total, num_cpus, total, num_cpus * 100)
+def get_perfdata(num_cpus, names, cpus, results, diff):
+    total = sum(x[1] for x in results)
+    perfdata = "Total Usage = {:.2f}% in {:.0f}s, CPUs = {:d}|total={:.2f}%;;;0;{:d}".format(total, diff, num_cpus, total, num_cpus * 100)
     for i in range(len(names)):
-        perfdata += " domain_{:}={:.2f}%;;;0;{:d}".format(names[i], avg[i], cpus[i] * 100)
+        for name,value in results:
+            if name == names[i]:
+                perfdata += " domain_{:}={:.2f}%;;;0;{:d}".format(name, value, cpus[i] * 100)
+                continue
     return perfdata
 
 # nagios compatible exit
@@ -54,45 +69,56 @@ def exit_status(status, perfdata="", message=None,):
     else:
         print("CPU {:} - {:}".format(status.name, perfdata))
 
-    sys.exit(status.value) 
+    sys.exit(status.value)
 
 def main():
+    histfile = "/tmp/.check_xen_cpu"
     parser = argparse.ArgumentParser(description="Reports CPU Usage for xen VMs")
-    parser.add_argument("-i", dest="interval", type=int, default=1, help="sampling interval in s")
-    parser.add_argument("-s", dest="samples", type=int, default=5, help="number of samples")
     args = parser.parse_args()
 
     # initialize handle
     handle = xenstat_init()
+    status = Status.OK
+    message = ""
     previous_sample = None
     past = None
-    total = None
 
     # prevent access without handle
     if handle is None:
         exit_status(Status.UNKNOWN, "Failed to get xenstat handle, you are probably not root")
 
     # sample cpu usage
-    for n in range(args.samples + 1):
-        node = xenstat_get_node(handle, XENSTAT_ALL)
-        domains = get_domains(node)
-        sample = get_domain_times(domains)
-        now = time.time()
+    node = xenstat_get_node(handle, XENSTAT_VCPU)
+    domains = get_domains(node)
+    sample = zip(get_domain_names(domains), get_domain_times(domains))
+    now = time.time()
 
-        if previous_sample is not None:
-            percent = map(lambda i: cputime_to_percent(previous_sample[i], sample[i], now - past), range(len(sample)))
-            if total is not None:
-                total = map(sum, zip(total, percent))
-            else:
-                total = percent
+    # load history file
+    try:
+        stat = os.stat(histfile)
+        past = stat.st_mtime
+        with open(histfile) as f:
+            previous_sample = json.load(f)
 
-        previous_sample, past = sample, now
+    except (IOError,OSError) as e:
+        if e.errno == os.errno.ENOENT:
+            status, message = Status.UNKNOWN, "History file not written yet"
+        else:
+            status, message = Status.UNKNOWN, "Failed to read the history file - {:}".format(e.strerror)
 
-        if n < args.samples:
-            time.sleep(args.interval)
+    # write history file
+    try:
+        with open(histfile, 'w') as f:
+            json.dump(sample, f)
+    except (IOError,OSError) as e:
+        status, message = Status.UNKNOWN, "Could not write history file - {:}".format(e.strerror)
 
-    # average all samples
-    avg = map(lambda x: x / float(args.samples), total)
+    # early exit on errors
+    if status > Status.OK:
+        exit_status(status, message)
+
+    # compute values
+    results = diff_results(previous_sample, sample, now - past)
 
     # get additional info
     num_cpus = xenstat_node_num_cpus(node)
@@ -101,7 +127,7 @@ def main():
     xenstat_uninit(handle)
 
     # generate output
-    exit_status(Status.OK, get_perfdata(num_cpus, cpus, names, avg))
+    exit_status(Status.OK, get_perfdata(num_cpus, names, cpus, results, now - past))
 
 if __name__ == "__main__":
     main()
